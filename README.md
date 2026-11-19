@@ -8,25 +8,29 @@ A fully synthesizable, high-performance, and feature-rich **AMBA APB (Advanced P
 
 This IP core introduces several unique architectural design improvements and solves critical hardware edge-case challenges commonly found in standard SPI Master implementations:
 
-### 1. Solving the Baud Divisor $BD = 2$ Hardware Corner Case
+### 1. Solving the Baud Divisor BD = 2 Hardware Corner Case
 In standard SPI clock generator designs, the baud divisor is governed by:
-$$\text{Baud Divisor} = (SPPR + 1) \cdot 2^{(SPR + 1)}$$
 
-For standard operation ($BD > 2$), internal toggling and strobe generation use counter comparisons:
+```verilog
+assign baud_divisor = (sppr + 1) << (spr + 1);
+```
+
+For standard operation (`baud_divisor > 2`), internal toggling and strobe generation use counter comparisons:
 - **MISO sample strobe:** `count == (baud_divisor / 2) - 1`
 - **MOSI shift strobe:** `count == (baud_divisor / 2) - 2`
 
 #### The Problem:
-When the core is configured for maximum SPI transmission speed ($BD = 2$):
-$$\frac{BD}{2} - 2 = 1 - 2 = -1$$
-In unsigned hardware counter arithmetic (12-bit register), $-1$ evaluates to `12'hFFF` ($4095$). Since `count` only counts from $0$ to $(BD/2) - 1 = 0$, `count` never matches $-1$. Consequently, the MOSI shift strobe never fires, locking up data transmission and causing SPI communication to completely fail at highest baud rates.
+When the core is configured for maximum SPI transmission speed (`baud_divisor = 2`):
+$$(BD / 2) - 2 = 1 - 2 = -1$$
+
+In unsigned hardware counter arithmetic (12-bit register), `-1` evaluates to `12'hFFF` (4095). Since `count` only counts from `0` to `(baud_divisor / 2) - 1 = 0`, `count` never matches `-1`. Consequently, the MOSI shift strobe never fires, locking up data transmission and causing SPI communication to completely fail at highest baud rates.
 
 #### The Unique Solution:
-A dedicated cycle-accurate condition block was designed for $BD = 2$. By tracking the instantaneous state of `sclk` in conjunction with `cpol` and `cpha`, accurate 1-cycle pulses for both MOSI shifting (`mosi_pos`, `mosi_neg`) and MISO sampling (`miso_pos`, `miso_neg`) are asserted deterministically.
+A dedicated cycle-accurate condition block was designed for `baud_divisor == 2`. By tracking the instantaneous state of `sclk` in conjunction with `cpol` and `cpha`, accurate 1-cycle pulses for both MOSI shifting (`mosi_pos`, `mosi_neg`) and MISO sampling (`miso_pos`, `miso_neg`) are asserted deterministically.
 
-#### $BD = 2$ Timing and Strobe Condition Table
+#### BD = 2 Timing and Strobe Condition Table
 
-##### MISO Sampling Strobe Conditions ($BD = 2$)
+##### MISO Sampling Strobe Conditions (`baud_divisor == 2`)
 | SCLK State | CPOL | CPHA | SPI Mode | Triggered Strobe | Action Description |
 | :---: | :---: | :---: | :---: | :---: | :--- |
 | **High (`1`)** | `0` | `0` | Mode 0 | `miso_pos <= 1'b1` | Latch incoming MISO bit on SCLK rising edge |
@@ -34,7 +38,7 @@ A dedicated cycle-accurate condition block was designed for $BD = 2$. By trackin
 | **Low (`0`)** | `1` | `0` | Mode 2 | `miso_neg <= 1'b1` | Latch incoming MISO bit on SCLK falling edge |
 | **Low (`0`)** | `1` | `1` | Mode 3 | `miso_pos <= 1'b1` | Latch incoming MISO bit on SCLK rising edge |
 
-##### MOSI Shifting Strobe Conditions ($BD = 2$)
+##### MOSI Shifting Strobe Conditions (`baud_divisor == 2`)
 | SCLK State | CPOL | CPHA | SPI Mode | Triggered Strobe | Action Description |
 | :---: | :---: | :---: | :---: | :---: | :--- |
 | **High (`1`)** | `1` | `0` | Mode 2 | `mosi_pos <= 1'b1` | Drive next MOSI bit on SCLK rising edge |
@@ -53,7 +57,7 @@ This design optimizes the shifter core (`spi_shifter.v`) down to:
 - **Two 4-bit Index Counters (`count1` & `count2`):**
   - `count1`: Exclusively controls the bit index for MOSI serial shifting.
   - `count2`: Exclusively controls the bit index for MISO serial sampling.
-- **Dynamic Direction Indexing:** Seamlessly switches between MSB-First (`lsbfe = 0`, decrementing $7 \to 0$) and LSB-First (`lsbfe = 1`, incrementing $0 \to 7$) without duplicating hardware multiplexers.
+- **Dynamic Direction Indexing:** Seamlessly switches between MSB-First (`lsbfe = 0`, decrementing from 7 to 0) and LSB-First (`lsbfe = 1`, incrementing from 0 to 7) without duplicating hardware multiplexers.
 - **Race-Free Bit Tracking:** Completely decouples transmit and receive timing across all four SPI modes, preventing any data overwrites during full-duplex transfers.
 
 ---
@@ -66,7 +70,9 @@ In naive APB-to-SPI bridge designs, transfer initiation and buffer status are of
 #### The Unique Solution:
 The APB Slave Interface (`APB_slave_interface.v`) implements a robust, purely event-driven control handshake that never compares data values to zero:
 - **Cycle-Accurate Write Detection:** `tx_write` is asserted strictly based on APB bus qualifiers:
-  $$\text{tx\_write} = \text{wr\_enable} \land (paddr == 3'b101) \land \text{spi\_active} \land \text{sptef}$$
+  ```verilog
+  wire tx_write = wr_enable && (paddr == 3'b101) && spi_active && sptef;
+  ```
 - **State-Tracking Signals:**
   - `tx_pending`: Flags that valid data has been written to `DR` and is awaiting transmission.
   - `send_data`: Pulses high for exactly one clock cycle when the SPI engine is ready to capture `DR` into `data_mosi`.
@@ -75,7 +81,7 @@ The APB Slave Interface (`APB_slave_interface.v`) implements a robust, purely ev
 - **Deterministic Status Register (`SR`) Updates:**
   - `SPTEF` (SPI Transmit Empty Flag): Cleared immediately on `tx_write`, and re-asserted when data is dispatched (`transferred == 1`).
   - `SPIF` (SPI Interrupt / Transfer Complete Flag): Asserted cleanly when `recieve_delay` fires, signaling new data is in `DR`.
-  - **Atomic Hardware Clearing Sequence:** Automatically tracks reading the Status Register (`paddr == 3'b011` $\implies$ sets `sr_read_done`), followed by reading the Data Register (`paddr == 3'b101` $\implies$ clears `spif`), adhering strictly to standard SPI hardware specifications.
+  - **Atomic Hardware Clearing Sequence:** Automatically tracks reading the Status Register (`paddr == 3'b011` -> sets `sr_read_done`), followed by reading the Data Register (`paddr == 3'b101` -> clears `spif`), adhering strictly to standard SPI hardware specifications.
 
 ---
 
@@ -112,7 +118,7 @@ Top-level structural wrapper interconnecting:
 - **`spi_shifter` (M4):** Executes full-duplex serial shifting on `mosi_out` and `miso_in`.
 
 ### 2. `APB_slave_interface.v`
-- Implements standard APB3 Slave protocol (IDLE $\to$ SETUP $\to$ ENABLE).
+- Implements standard APB3 Slave protocol (`IDLE` -> `SETUP` -> `ENABLE`).
 - Memory-mapped internal registers:
   - `CR1` (Address `3'b000`): Control Register 1 (`SPIE`, `SPE`, `SPTIE`, `MSTR`, `CPOL`, `CPHA`, `LSBFE`).
   - `CR2` (Address `3'b001`): Control Register 2 (`MODFEN`, `SPISWAI`).
@@ -122,13 +128,15 @@ Top-level structural wrapper interconnecting:
 - Manages SPI power states: `SPI_RUN`, `SPI_WAIT`, `SPI_STOP`.
 
 ### 3. `baud_rate_generator.v`
-- Programmable divider supporting division ratios from $BD = 2$ up to $BD = 4096$.
+- Programmable divider supporting division ratios from `baud_divisor = 2` up to `baud_divisor = 4096`.
 - Generates directional strobes (`mosi_pos`, `mosi_neg`, `miso_pos`, `miso_neg`) for all 4 SPI modes.
-- Integrated $BD = 2$ corner-case correction logic.
+- Integrated `baud_divisor == 2` corner-case correction logic.
 
 ### 4. `spi_slave_control_select.v`
 - Calculates target transfer duration:
-  $$\text{target} = \text{baud\_divisor} \times 8 = \text{baud\_divisor} \ll 3$$
+  ```verilog
+  wire [14:0] target = baud_divisor << 3; // (baud_divisor * 8 bits)
+  ```
 - Drives active-low Slave Select (`ss`) and Transfer-in-Progress (`tip`) indicator.
 - Asserts `recieve_data` at the exact completion cycle.
 
@@ -155,7 +163,7 @@ Top-level structural wrapper interconnecting:
 
 The IP core is comprehensively verified across all hierarchy levels:
 - **`top_module_tb.v`**: Full system verification covering APB register configuration, clock generation, transmission, reception, mode switching, and flag handshakes.
-- **`baud_rate_generator_tb.v`**: Rigorous testing of baud divisor ratios including the $BD = 2$ corner case and all CPOL/CPHA modes.
+- **`baud_rate_generator_tb.v`**: Rigorous testing of baud divisor ratios including the `BD = 2` corner case and all CPOL/CPHA modes.
 - **`spi_shifter_tb.v`**: Verification of MSB/LSB data shifting and full-duplex operation.
 - **`APB_slave_interface_tb.v`**: Verification of APB FSM, interrupt generation, and zero-data transfer robustness.
 - **`spi_slave_control_select_tb.v`**: Verification of chip select timing and transfer duration accuracy.
